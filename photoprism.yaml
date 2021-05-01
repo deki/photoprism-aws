@@ -1,0 +1,464 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: An example CloudFormation template to deploy PhotoPrism on ECS Fargate along with a RDS MariaDB.
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+# uncomment to allow HTTPS instead of HTTP
+#  Certificate:
+#    Type: String
+#    # Update with the certificate ARN from Certificate Manager, which must exist in the same region.
+#    Default: 'arn:aws:acm:region:123456789010:certificate/00000000-0000-0000-0000-000000000000'
+  Image:
+    Type: String
+    Default: photoprism/photoprism:latest
+  ServiceName:
+    Type: String
+    Default: PhotoprismService
+  ContainerPort:
+    Type: Number
+    Default: 2342
+  LoadBalancerPort:
+    Type: Number
+    Default: 80 # change to 443 for HTTPS
+  DatabaseName:
+    Type: String
+    Default: photoprism
+  DatabaseUsername:
+    Type: String
+    Default: photoprism
+  DatabasePassword:
+    Type: String
+    MinLength: 1
+  DatabasePort:
+    Type: Number
+    Default: 3306
+  HealthCheckPath:
+    Type: String
+    Default: /
+#  HostedZoneName:
+#    Type: String
+#    Default: company.com
+#  Subdomain:
+#    Type: String
+#    Default: Photoprismservice
+  MinContainers:
+    Type: Number
+    Default: 1
+    Description: for autoscaling
+  MaxContainers:
+    Type: Number
+    Default: 10
+    Description: for autoscaling
+  AutoScalingTargetValue:
+    Type: Number
+    Default: 50
+    Description: target CPU utilization (%)
+  PosixUserIdentifier:
+    Type: Number
+    Default: 1000
+  PosixGroupIdentifier:
+    Type: Number
+    Default: 1000
+  PhotoPrismAdminPassword:
+    Type: String
+    MinLength: 4
+    Description: Your initial admin password (min 4 characters)
+  PhotoPrismSiteTitle:
+    Type: String
+    Default: PhotoPrism
+  PhotoPrismSiteCaption:
+    Type: String
+    Default: Browse Your Life
+  PhotoPrismSiteDescription:
+    Type: String
+    Default: Description
+  PhotoPrismSiteAuthor:
+    Type: String
+    Default: Author
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join ['', [!Ref ServiceName, Cluster]]
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # log group needs to be created before it is used.
+    DependsOn: LogGroup
+    Properties:
+      # Name for the task definition
+      Family: !Join ['', [!Ref ServiceName, TaskDefinition]]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 2048
+      Memory: 4GB
+      # "The ARN of the task execution role that containers in this task can assume. All containers in this task are granted the permissions that are specified in this role."
+      # "There is an optional task execution IAM role that you can specify with Fargate to allow your Fargate tasks to make API calls to Amazon ECR."
+      ExecutionRoleArn: !Ref ExecutionRole
+      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role that grants containers in the task permission to call AWS APIs on your behalf."
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Ref Image
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          User: !Join ['', [!Ref PosixUserIdentifier, ':', !Ref PosixGroupIdentifier]]
+          Environment:
+            - Name: PHOTOPRISM_ADMIN_PASSWORD
+              Value: !Ref PhotoPrismAdminPassword # Your initial admin password (min 4 characters)
+            - Name: PHOTOPRISM_HTTP_PORT
+              Value: !Ref ContainerPort # Built-in Web server port
+            - Name: PHOTOPRISM_HTTP_COMPRESSION
+              Value: gzip # Improves transfer speed and bandwidth utilization (none or gzip)
+            - Name: PHOTOPRISM_DEBUG
+              Value: false # Run in debug mode (shows additional log messages)
+            - Name: PHOTOPRISM_PUBLIC
+              Value: false # No authentication required (disables password protection)
+            - Name: PHOTOPRISM_READONLY
+              Value: false # Don't modify originals directory (reduced functionality)
+            - Name: PHOTOPRISM_EXPERIMENTAL
+              Value: false # Enables experimental features
+            - Name: PHOTOPRISM_DISABLE_WEBDAV
+              Value: false # Disables built-in WebDAV server
+            - Name: PHOTOPRISM_DISABLE_SETTINGS
+              Value: false # Disables Settings in Web UI
+            - Name: PHOTOPRISM_DISABLE_TENSORFLOW
+              Value: false # Disables using TensorFlow for image classification
+            - Name: PHOTOPRISM_DARKTABLE_PRESETS
+              Value: false # Enables Darktable presets and disables concurrent RAW conversion
+            - Name: PHOTOPRISM_DETECT_NSFW
+              Value: false # Flag photos as private that MAY be offensive (requires TensorFlow)
+            - Name: PHOTOPRISM_UPLOAD_NSFW
+              Value: true # Allow uploads that MAY be offensive
+            # - Name: PHOTOPRISM_DATABASE_DRIVER
+            #  Value: sqlite # SQLite is an embedded database that doesn't require a server
+            - Name: PHOTOPRISM_DATABASE_DRIVER
+              Value: mysql # Use MariaDB (or MySQL) instead of SQLite for improved performance
+            - Name: PHOTOPRISM_DATABASE_SERVER
+              Value: !Join [ '', [ !GetAtt [ PhotoprismDatabase, Endpoint.Address ], ':', !GetAtt [PhotoprismDatabase, Endpoint.Port ] ] ] # MariaDB database server (hostname:port)
+            - Name: PHOTOPRISM_DATABASE_NAME
+              Value: !Ref DatabaseName # MariaDB database schema name
+            - Name: PHOTOPRISM_DATABASE_USER
+              Value: !Ref DatabaseUsername  # MariaDB database user name
+            - Name: PHOTOPRISM_DATABASE_PASSWORD
+              Value: !Ref DatabasePassword # MariaDB database user password
+            #- Name: PHOTOPRISM_SITE_URL
+            #  Value: "http://localhost:2342/"  # Public PhotoPrism URL
+            - Name: PHOTOPRISM_SITE_TITLE
+              Value: !Ref PhotoPrismSiteTitle
+            - Name: PHOTOPRISM_SITE_CAPTION
+              Value: !Ref PhotoPrismSiteCaption
+            - Name: PHOTOPRISM_SITE_DESCRIPTION
+              Value: !Ref PhotoPrismSiteDescription
+            - Name: PHOTOPRISM_SITE_AUTHOR
+              Value: !Ref PhotoPrismSiteAuthor
+          MountPoints:
+            - SourceVolume: photoprism-settings-index-sidecar
+              ContainerPath: '/photoprism/storage'
+              ReadOnly: false
+            - SourceVolume: photoprism-photo-video-originals
+              ContainerPath: '/photoprism/originals'
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+      Volumes:
+        - Name: photoprism-settings-index-sidecar
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref PhotoprismEFSVolume
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref PhotoprismEFSAccessPointSettingsIndexSidecar
+        - Name: photoprism-photo-video-originals
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref PhotoprismEFSVolume
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref PhotoprismEFSAccessPointOriginals
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, ExecutionRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, TaskRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      # ManagedPolicyArns:
+      #   -
+      # Policies:
+      #   -
+  # A role needed for auto scaling
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, AutoScalingRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['', [!Ref ServiceName, ContainerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['', [!Ref ServiceName, LoadBalancerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref LoadBalancerPort
+          ToPort: !Ref LoadBalancerPort
+          CidrIp: 0.0.0.0/0
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerHTTP
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 300
+      LaunchType: FARGATE
+      # requires additional ssmmessages policy, see https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html#ecs-exec-enabling-and-using
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # can be changed to DISABLED if using private subnets that have access to a NAT gateway
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref Subnet1
+            - !Ref Subnet2
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Join ['', [!Ref ServiceName, TargetGroup]]
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 # default = 300
+        - Key: stickiness.enabled
+          Value: true
+      TargetType: ip
+      VpcId: !Ref VPC
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref LoadBalancerPort
+      Protocol: HTTP
+#      Protocol: HTTPS
+#      Certificates:
+#        - CertificateArn: !Ref Certificate
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      LoadBalancerAttributes:
+        # default
+        - Key: idle_timeout.timeout_seconds
+          Value: 60
+      Name: !Join ['', [!Ref ServiceName, LoadBalancer]]
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+#  DNSRecord:
+#    Type: AWS::Route53::RecordSet
+#    Properties:
+#      HostedZoneName: !Join ['', [!Ref HostedZoneName, .]]
+#      Name: !Join ['', [!Ref Subdomain, ., !Ref HostedZoneName, .]]
+#      Type: A
+#      AliasTarget:
+#        DNSName: !GetAtt LoadBalancer.DNSName
+#        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [!Ref ServiceName, TaskDefinition]]
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', [service, !Ref Cluster, !GetAtt Service.Name]]
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Join ['', [!Ref ServiceName, AutoScalingPolicy]]
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 10
+        ScaleOutCooldown: 10
+        # e.g. keep things at or lower than x% CPU utilization
+        TargetValue: !Ref AutoScalingTargetValue
+  PhotoprismEFSVolume:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-efs-vol"
+  PhotoprismEFSAccessPointSettingsIndexSidecar:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref PhotoprismEFSVolume
+      PosixUser:
+        Uid: !Ref PosixUserIdentifier
+        Gid: !Ref PosixGroupIdentifier
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: !Ref PosixGroupIdentifier
+          OwnerUid: !Ref PosixUserIdentifier
+          Permissions: "0700"
+        Path: "/settings-index-sidecar"
+  PhotoprismEFSAccessPointOriginals:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref PhotoprismEFSVolume
+      PosixUser:
+        Uid: !Ref PosixUserIdentifier
+        Gid: !Ref PosixGroupIdentifier
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: !Ref PosixGroupIdentifier
+          OwnerUid: !Ref PosixUserIdentifier
+          Permissions: "0755"
+        Path: "/originals"
+  PhotoprismEFSServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-efs-server-endpoints"
+      GroupDescription: Which client ip addrs are allowed to access EFS server endpoints for photoprism mount
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-efs-server"
+  PhotoprismEFSMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref PhotoprismEFSVolume
+      SecurityGroups:
+        - !Ref PhotoprismEFSServerSecurityGroup
+      SubnetId: !Ref Subnet1
+  PhotoprismEFSMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref PhotoprismEFSVolume
+      SecurityGroups:
+        - !Ref PhotoprismEFSServerSecurityGroup
+      SubnetId: !Ref Subnet2
+  PhotoprismDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBSubnetGroupName: !Ref PhotoprismDatabaseSubnetGroup
+      DBName: !Ref DatabaseName
+      VPCSecurityGroups:
+        - Ref: PhotoprismDatabaseSecurityGroup
+      AllocatedStorage: '5'
+      DBInstanceClass: db.t3.micro
+      Port: !Ref DatabasePort
+      Engine: mariadb
+      EngineVersion: 10.5
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      DBParameterGroupName: !Ref PhotoprismDatabaseParamGroup
+    DeletionPolicy: Snapshot
+  PhotoprismDatabaseParamGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: mariadb10.5
+      Description: PhotoPrism database parameter group
+      Parameters:
+        tx_isolation: 'READ-COMMITTED'
+        character_set_server: 'utf8mb4'
+        collation_server: 'utf8mb4_unicode_ci'
+        max_connections: '512'
+        innodb_rollback_on_timeout: 'OFF'
+        innodb_lock_wait_timeout: '50'
+  PhotoprismDatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: PhotoPrism database subnet group
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+  PhotoprismDatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Ingress for PhotoPrism database
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref DatabasePort
+          ToPort: !Ref DatabasePort
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup
+Outputs:
+  LoadBalancerUrl:
+    Description: The URL of the loadbalancer
+    Value: !GetAtt LoadBalancer.DNSName
+#  Endpoint:
+#    Description: Endpoint
+#    Value: !Join ['', ['https://', !Ref DNSRecord]]
