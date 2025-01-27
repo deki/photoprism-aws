@@ -38,7 +38,7 @@ Parameters:
     Default: 3306
   HealthCheckPath:
     Type: String
-    Default: /
+    Default: /api/v1/status
 #  HostedZoneName:
 #    Type: String
 #    Default: company.com
